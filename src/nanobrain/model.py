@@ -136,6 +136,44 @@ class ViTMAE3D(nn.Module):
         x = self.decoder_head(x)
         return x
 
+    def sample_patches(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+        num_samples: int = 1,
+        seq_length: int | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Sample num_samples patch sequences per image, flattened into the batch.
+
+        Returns patches, mask patches, coords and patch ids, each [B*num_samples, N, ...].
+        seq_length None keeps all mask patches of the image with the most.
+        """
+        B = images.shape[0]
+        patches = patchify3d(images, self.patch_size)
+        mask_patches = patchify3d(mask, self.patch_size)
+        coord = self.coord_grid.expand(B, -1, -1)
+
+        order = sample_sequences(mask_patches, num_samples, seq_length)
+        batch_ids = torch.arange(B, device=images.device)[:, None, None]
+        patches = patches[batch_ids, order].flatten(0, 1)
+        mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
+        coord = coord[batch_ids, order].flatten(0, 1)
+        return patches, mask_patches, coord, order.flatten(0, 1)
+
+    def forward_embedding(
+        self,
+        images: Float[Tensor, "1 X Y Z"],
+        mask: Float[Tensor, "1 X Y Z"],
+    ) -> tuple[Float[Tensor, "1 C D"] | None, Float[Tensor, "1 L D"]]:
+        """Encoder embeddings of all mask patches, no masking: (cls, patches).
+
+        One volume at a time, since the number of mask patches varies.
+        """
+        patches, _, coord, _ = self.sample_patches(images, mask)
+        embeds = self.forward_encoder(patches, coord)
+        cls_embeds = embeds[:, : self.class_tokens] if self.class_tokens else None
+        return cls_embeds, embeds[:, self.class_tokens :]
+
     def forward(
         self,
         images: Float[Tensor, "B X Y Z"],
@@ -148,19 +186,12 @@ class ViTMAE3D(nn.Module):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
-        patches = patchify3d(images, self.patch_size)
-        mask_patches = patchify3d(mask, self.patch_size)
-        coord = self.coord_grid.expand(B, -1, -1)
-
-        # sample num_samples sequences per image, then flatten them into the batch
         # num_predict None predicts all remaining patches (dense decoding)
         seq_length = None if num_predict is None else num_visible + num_predict
-        order = sample_sequences(mask_patches, num_samples, seq_length)
-        num_predict = order.shape[2] - num_visible
-        batch_ids = torch.arange(B, device=images.device)[:, None, None]
-        patches = patches[batch_ids, order].flatten(0, 1)
-        mask_patches = mask_patches[batch_ids, order].flatten(0, 1)
-        coord = coord[batch_ids, order].flatten(0, 1)
+        patches, mask_patches, coord, patch_ids = self.sample_patches(
+            images, mask, num_samples, seq_length
+        )
+        num_predict = patches.shape[1] - num_visible
 
         vis_patches, target_patches = torch.split(patches, [num_visible, num_predict], dim=1)
         vis_mask_patches, target_mask_patches = torch.split(
@@ -176,7 +207,6 @@ class ViTMAE3D(nn.Module):
         if not with_state:
             return loss
 
-        patch_ids = order.flatten(0, 1)
         image_ids = torch.arange(B, device=images.device).repeat_interleave(num_samples)
         vis_ids, target_ids = torch.split(patch_ids, [num_visible, num_predict], dim=1)
 
