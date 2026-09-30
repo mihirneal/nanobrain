@@ -1,6 +1,7 @@
 """nanobrain ViTMAE3D: the nii.gz transform, the encoder wrapper, and its registered constructor."""
 
 import logging
+import math
 
 import nibabel as nib
 import numpy as np
@@ -54,12 +55,33 @@ class NanobrainTransform:
 
         spacing = tuple(np.linalg.norm(fit_img.affine[:3, :3], axis=0).tolist())
         image = resample_image(image, spacing=spacing, target_spacing=TARGET_SPACING)
+        affine = grid_affine(fit_img, image.shape, self.grid_size)
         image = fit_to_shape(image, target_shape=self.grid_size)
         mask = resample_image(
             mask.float(), spacing=spacing, target_spacing=TARGET_SPACING, mode="nearest"
         )
         mask = fit_to_shape(mask, target_shape=self.grid_size)
-        return {"image": image * mask, "mask": mask}
+        return {"image": image * mask, "mask": mask, "affine": torch.from_numpy(affine)}
+
+
+def grid_affine(
+    fit_img: nib.Nifti1Image,
+    resampled_shape: tuple[int, int, int],
+    grid_size: tuple[int, int, int],
+) -> np.ndarray:
+    """Voxel to world affine of the final grid, following resample_image (trilinear,
+    align_corners=False) and then fit_to_shape (x/y centered, z top aligned)."""
+    in_shape = np.array(fit_img.shape[:3], dtype=float)
+    out_shape = np.array(resampled_shape, dtype=float)
+    scale = in_shape / out_shape
+    diff = np.array(grid_size) - out_shape
+    before = np.array([diff[0] // 2, diff[1] // 2, diff[2]])
+    # final voxel f is resampled voxel f - before, which samples fit_img voxel
+    # (f - before + 0.5) * scale - 0.5
+    to_fit = np.eye(4)
+    to_fit[:3, :3] = np.diag(scale)
+    to_fit[:3, 3] = (0.5 - before) * scale - 0.5
+    return fit_img.affine @ to_fit
 
 
 class ViTMAE3DWrapper(nn.Module):
@@ -69,9 +91,21 @@ class ViTMAE3DWrapper(nn.Module):
 
     def forward(self, batch: dict[str, Tensor]) -> Embeddings:
         device_type = batch["image"].device.type
+        # forward_embedding, keeping the patch ids to place the tokens on the patch grid
         with torch.autocast(device_type, torch.bfloat16, enabled=device_type == "cuda"):
-            embeds = self.model.forward_embedding(batch["image"], batch["mask"])
-        return Embeddings(*(None if x is None else x.float() for x in embeds))
+            patches, _, coord, patch_ids = self.model.sample_patches(batch["image"], batch["mask"])
+            embeds = self.model.forward_encoder(patches, coord).float()
+        num_cls = self.model.class_tokens
+        cls_embeds = embeds[:, :num_cls] if num_cls else None
+        patch_embeds = embeds[:, num_cls:]
+
+        # patch ids index the patch grid in patchify3d order
+        B, _, D = patch_embeds.shape
+        grid_shape = [size // self.model.patch_size for size in self.model.grid_size]
+        grid_embeds = patch_embeds.new_zeros(B, math.prod(grid_shape), D)
+        grid_embeds.scatter_(1, patch_ids[..., None].expand(-1, -1, D), patch_embeds)
+        grid_embeds = grid_embeds.transpose(1, 2).reshape(B, D, *grid_shape)
+        return Embeddings(cls_embeds, patch_embeds, grid_embeds)
 
 
 @register_model
