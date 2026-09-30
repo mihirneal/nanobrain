@@ -52,7 +52,7 @@ def load_subjects(data_root: Path) -> list[dict]:
     rows = []
     for seg_path in sorted(data_root.glob("labels/*/*/seg.nii.gz")):
         rel_dir = seg_path.parent.relative_to(data_root / "labels")
-        image_dir = data_root / "preprocessed" / rel_dir
+        image_dir = data_root / "images" / rel_dir
         labels = json.loads((seg_path.parent / "labels.json").read_text())
         images = {mod: image_dir / f"{mod}.nii.gz" for mod in MODALITIES}
         rows.append(
