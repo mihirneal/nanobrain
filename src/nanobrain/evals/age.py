@@ -39,12 +39,12 @@ def download_data() -> Path:
 def load_subjects(data_root: Path) -> list[dict]:
     """Load subjects from the validation layout."""
     rows = []
-    for path in sorted(data_root.glob("preprocessed/*/*/t1w.nii.gz")):
-        rel_dir = path.parent.relative_to(data_root / "preprocessed")
+    for path in sorted(data_root.glob("images/*/*/t1w.nii.gz")):
+        rel_dir = path.parent.relative_to(data_root / "images")
         labels = json.loads((data_root / "labels" / rel_dir / "labels.json").read_text())
         age = float(labels["age"])
         rows.append({"subject": rel_dir.parts[0], "t1w": path, "age": age})
-    assert rows, f"no images found in {data_root}/preprocessed"
+    assert rows, f"no images found in {data_root}/images"
     return rows
 
 
@@ -130,7 +130,7 @@ def main(args: argparse.Namespace):
             run_name += "_random"
         if args.pool != "avg":
             run_name += f"_{args.pool}"
-        args.output_dir = args.ckpt_path.parent / "evals" / "brain_age" / run_name
+        args.output_dir = args.ckpt_path.parent / "evals" / "age" / run_name
     run_dir = args.output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,7 +187,7 @@ if __name__ == "__main__":
         "--output-dir",
         type=Path,
         default=None,
-        help="default <ckpt dir>/evals/brain_age/<ckpt>[_random][_cls]",
+        help="default <ckpt dir>/evals/age/<ckpt>[_random][_cls]",
     )
     parser.add_argument(
         "--random-init", action="store_true", help="random init weights, as a baseline"
