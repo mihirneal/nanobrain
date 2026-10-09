@@ -132,7 +132,7 @@ class ViTMAE3D(nn.Module):
 
         embeds = self.decoder_proj(embeds)
 
-        mask_tokens = self.mask_token.expand(B, M, -1)
+        mask_tokens = self.mask_token.expand(B, M, -1).to(embeds.dtype)
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
 
         x = torch.cat([embeds, mask_tokens], dim=1)

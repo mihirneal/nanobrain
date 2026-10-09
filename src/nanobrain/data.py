@@ -33,37 +33,50 @@ class BrainNpzDataset(Dataset):
         return sample
 
 
-def process_sample(sample: dict[str, torch.Tensor | Any]):
-    values = sample["values"]
-    mask_rle = sample["mask"]
-    shape = sample["shape"]
-    spacing = sample["spacing"]
+def process_batch(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    # each sample is resampled to 1 mm and written straight into its slot of a preallocated
+    # batch, cropped or zero padded to GRID_SHAPE 
+    device = samples[0]["values"].device
+    images = torch.zeros(len(samples), *GRID_SHAPE, device=device)
+    masks = torch.zeros(len(samples), *GRID_SHAPE, device=device)
+    for ii, sample in enumerate(samples):
+        spacing = sample["spacing"]
 
-    # normalize values
-    values = values.float()
-    values = values / values.max()
-    values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+        # normalize values
+        values = sample["values"].float()
+        values = values / values.max()
+        values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
 
-    # decode mask
-    mask = brle_to_dense(mask_rle, shape=shape)
+        # decode mask
+        mask = brle_to_dense(sample["mask"], shape=sample["shape"])
 
-    # make dense image
-    image = torch.zeros(mask.shape, dtype=values.dtype, device=values.device)
-    image.masked_scatter_(mask, values)
+        # make dense image
+        image = torch.zeros(mask.shape, dtype=values.dtype, device=values.device)
+        image.masked_scatter_(mask, values)
 
-    # resizing
-    image = resample_image(image, spacing=spacing, target_spacing=TARGET_SPACING)
-    image = fit_to_shape(image, target_shape=GRID_SHAPE)
+        # resizing. the mask resamples as uint8, nearest keeps it 0/1
+        image = resample_image(image, spacing=spacing, target_spacing=TARGET_SPACING)
+        mask = resample_image(
+            mask.to(torch.uint8), spacing=spacing, target_spacing=TARGET_SPACING, mode="nearest"
+        )
 
-    mask = mask.float()
-    mask = resample_image(mask, spacing=spacing, target_spacing=TARGET_SPACING, mode="nearest")
-    mask = fit_to_shape(mask, target_shape=GRID_SHAPE)
+        # crop/pad into the batch and apply mask
+        src, dst = fit_slices(image.shape, GRID_SHAPE)
+        masks[ii][dst] = mask[src]
+        torch.mul(image[src], mask[src], out=images[ii][dst])
+    return {"image": images, "mask": masks}
 
-    # apply mask
-    image = image * mask
 
-    sample = {"image": image, "mask": mask}
-    return sample
+def fit_slices(shape: tuple[int, ...], target_shape: tuple[int, ...]) -> tuple[tuple, tuple]:
+    """Source and destination slices of fit_to_shape's pad (x/y centered, z top aligned)."""
+    src, dst = [], []
+    for axis, (size, target) in enumerate(zip(shape, target_shape)):
+        diff = target - size
+        before = diff // 2 if axis < 2 else diff
+        n = min(size + before, target) - max(before, 0)
+        src.append(slice(max(-before, 0), max(-before, 0) + n))
+        dst.append(slice(max(before, 0), max(before, 0) + n))
+    return tuple(src), tuple(dst)
 
 
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:

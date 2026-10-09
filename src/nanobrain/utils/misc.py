@@ -7,6 +7,7 @@
 # dino: https://github.com/facebookresearch/dino/blob/main/utils.py
 
 import datetime
+import functools
 import logging
 import os
 import random
@@ -356,31 +357,30 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
 # optimization utils
 
 
-# from capi
-class WarmupThenCosine:
+class WarmupStableDecay:
+    """Linear warmup, constant at base_value, then linear decay to final_value over the last
+    decay_frac of all iters. A decay longer than what follows the warmup is cut to fit."""
+
     def __init__(
         self,
         base_value: float,
         final_value: float,
         total_iters: int,
         warmup_iters: int = 0,
-        start_warmup_value: float = 0.0,
-        freeze_iters: int = 0,
-        truncate_cos: float = 1.0,
+        decay_frac: float = 0.2,
     ):
-        super().__init__()
         self.final_value = final_value
         self.total_iters = total_iters
 
-        freeze_schedule = np.zeros(freeze_iters)
-
-        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
-
-        iters = np.arange(total_iters - warmup_iters - freeze_iters)
-        schedule = final_value + 0.5 * (base_value - final_value) * (
-            1 + np.cos(np.pi * truncate_cos * iters / len(iters))
+        decay_iters = min(round(decay_frac * total_iters), total_iters - warmup_iters)
+        stable_iters = total_iters - warmup_iters - decay_iters
+        self.schedule = np.concatenate(
+            (
+                np.linspace(0.0, base_value, warmup_iters),
+                np.full(stable_iters, base_value),
+                np.linspace(base_value, final_value, decay_iters),
+            )
         )
-        self.schedule = np.concatenate((freeze_schedule, warmup_schedule, schedule))
         assert len(self.schedule) == self.total_iters
 
     def __getitem__(self, it: int) -> float:
@@ -499,16 +499,28 @@ def send_data(x, device=None):
     return x
 
 
-def pre_send_to_cuda_wrapper(generator, device=None):
+@functools.cache
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    # one side stream per device for the whole run. the caching allocator keeps freed memory
+    # per stream, so a new stream every epoch strands the previous epoch's cached blocks
+    return torch.cuda.Stream(device)
+
+
+def pre_send_to_cuda_wrapper(generator, device=None, process_fn=None):
     """From apex"""
     data = None
-    stream = torch.cuda.Stream(device)
+    stream = _side_stream(torch.device("cuda" if device is None else device))
     for next_data in generator:
         with torch.cuda.stream(stream):
             next_data = send_data(next_data, device=device)
+            if process_fn is not None:
+                next_data = process_fn(next_data)
         if data is not None:
             yield data
         torch.cuda.current_stream(device).wait_stream(stream)
+        for x in torch.utils._pytree.tree_leaves(next_data):
+            if isinstance(x, Tensor):
+                x.record_stream(torch.cuda.current_stream(device))
         data = next_data
     if data is not None:
         yield data

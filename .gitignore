@@ -47,3 +47,5 @@ slurms/
 # Subdirectories
 /third_party/
 /dev/
+checkpoints/
+data/

@@ -12,6 +12,7 @@ dependencies = [
     "braceexpand",
     "datasets",
     "einops",
+    "flash-attn-3",
     "flask",
     "fsspec",
     "huggingface-hub",
@@ -58,6 +59,7 @@ ignore = ["F722"]
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
+flash-attn-3 = { index = "pytorch-cu130" }
 synthseg = { git = "https://github.com/MedARC-AI/SynthSeg.git", rev = "2690d9ac9ae28323d03043406cd21db0a8741547" }
 
 [[tool.uv.index]]

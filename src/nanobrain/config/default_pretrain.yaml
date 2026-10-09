@@ -8,8 +8,8 @@ notes: null
 output_dir: output
 
 # Data.
-data_root: data/FOMO300K_images
-train_filelist: data/FOMO300K_images/filelist_subsampled.txt
+data_root: /data/mihir-stuff/nanobrain-prep/brain-mask
+train_filelist: /data/mihir-stuff/nanobrain-prep/brain-mask/filelist_subsampled.txt
 num_workers: 8
 prefetch_factor: 2
 
@@ -18,8 +18,8 @@ prefetch_factor: 2
 grid_size: [192, 240, 192]
 patch_size: 8
 
-# Sequence sampling. ~6400 mask patches per image on average, so num_visible 1280 is a
-# ~0.8 mask ratio.
+# Sequence sampling. ~3100 brain mask patches per image (median), so num_visible 1280 is a
+# ~0.6 mask ratio.
 num_visible: 1280
 num_predict: 1280
 num_samples: 2
@@ -29,21 +29,22 @@ model_kwargs:
   depth: 12
   embed_dim: 384
   num_heads: 6
-  decoder_depth: 4
+  decoder_depth: 2
   decoder_embed_dim: 512
   decoder_num_heads: 8
-  class_tokens: 1
+  class_tokens: 0
   drop_path_rate: 0.0
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
-epochs: 40
+epochs: 21
 batch_size: 32
 accum_iter: 1
 
-base_lr: 0.001
+base_lr: 0.004
 lr: null
 min_lr: 1e-6
 warmup_epochs: 5
+lr_decay_frac: 0.2
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0

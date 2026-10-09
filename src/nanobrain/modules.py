@@ -163,9 +163,9 @@ class SeparablePosEmbed3D(nn.Module):
         coord: Float[Tensor, "B N 3"],
     ) -> Float[Tensor, "B N D"]:
         pos_ids = torch.floor(coord / self.unit).to(torch.int64)
-        x = x + self.weight_x[pos_ids[:, :, 0]]
-        x = x + self.weight_y[pos_ids[:, :, 1]]
-        x = x + self.weight_z[pos_ids[:, :, 2]]
+        x = x + self.weight_x[pos_ids[:, :, 0]].to(x.dtype)
+        x = x + self.weight_y[pos_ids[:, :, 1]].to(x.dtype)
+        x = x + self.weight_z[pos_ids[:, :, 2]].to(x.dtype)
         return x
 
     def extra_repr(self):

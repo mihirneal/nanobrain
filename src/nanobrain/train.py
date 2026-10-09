@@ -14,11 +14,12 @@ import wandb
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
-from torch.utils.data import DataLoader, default_collate
+from torch.nn.attention import activate_flash_attention_impl, current_flash_attention_impl
+from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
-from nanobrain.data import BrainNpzDataset, process_sample
+from nanobrain.data import BrainNpzDataset, process_batch
 from nanobrain.model import ViTMAE3D, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
@@ -31,6 +32,7 @@ def main(args: DictConfig):
     # setup
     assert int(os.environ.get("WORLD_SIZE", 1)) == 1, "distributed training not supported"
     device = torch.device(args.device)
+    assert device.type == "cuda", "training runs on a gpu"
     misc.random_seed(args.seed)
 
     if args.name and not args.output_dir.endswith(args.name):
@@ -78,6 +80,11 @@ def main(args: DictConfig):
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
 
+    activate_flash_attention_impl("FA3")
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    logger.info(f"flash attention impl: {current_flash_attention_impl()}")
+
     # model
     model = ViTMAE3D.from_config(args)
     model.to(device)
@@ -117,11 +124,12 @@ def main(args: DictConfig):
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
-    lr_schedule = misc.WarmupThenCosine(
+    lr_schedule = misc.WarmupStableDecay(
         base_value=args.lr,
         final_value=args.min_lr,
         total_iters=total_steps,
         warmup_iters=warmup_steps,
+        decay_frac=args.lr_decay_frac,
     )
     logger.info(f"full schedule: epochs = {args.epochs} (steps = {total_steps})")
     logger.info(f"warmup: epochs = {args.warmup_epochs} (steps = {warmup_steps})")
@@ -198,9 +206,12 @@ def train_one_epoch(
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
     amp_dtype = getattr(torch, args.amp_dtype)
-    use_cuda = device.type == "cuda"
 
     optimizer.zero_grad()
+
+    # run volume processing on gpu, not cpu workers. copy and process the next batch on a
+    # side stream while the current step computes
+    data_loader = misc.pre_send_to_cuda_wrapper(data_loader, device, process_batch)
 
     for batch_idx, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
@@ -215,11 +226,6 @@ def train_one_epoch(
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
-        if use_cuda:
-            batch = misc.send_data(batch, device)
-
-        # run volume processing on gpu, not cpu workers
-        batch = default_collate([process_sample(sample) for sample in batch])
         images = batch["image"]
         masks = batch["mask"]
 
