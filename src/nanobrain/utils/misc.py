@@ -423,7 +423,23 @@ def backward_step(
 
 def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
     params = [p for group in optimizer.param_groups for p in group["params"]]
-    if max_norm:
+    # optimizers that defer the clip (fused muon) take the clip coefficient as grad_scale and
+    # apply it inside their step, saving a pass over their grads. same math as clip_grad_norm_
+    deferred = [
+        opt
+        for opt in getattr(optimizer, "optimizers", [optimizer])
+        if getattr(opt, "defers_grad_clip", False)
+    ]
+    if max_norm and deferred:
+        skip = {p for opt in deferred for group in opt.param_groups for p in group["params"]}
+        grads = [p.grad for p in params if p.grad is not None]
+        total_norm = nn.utils.get_total_norm(grads, error_if_nonfinite=False)
+        clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+        rest = [p.grad for p in params if p.grad is not None and p not in skip]
+        torch._foreach_mul_(rest, clip_coef)
+        for opt in deferred:
+            opt.grad_scale = clip_coef
+    elif max_norm:
         total_norm = nn.utils.clip_grad_norm_(params, max_norm, error_if_nonfinite=False)
     else:
         grads = [p.grad for p in params if p.grad is not None]
@@ -433,12 +449,12 @@ def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
 
 
 # from dinov2 with some minor changes
-def get_param_groups(model, patch_embed_lr_mult=1.0):
+def get_param_groups(model, patch_embed_lr_mult=1.0, skip_names=()):
     # no lr decay, we could add this later if needed
     all_params = []
 
     for name, param in model.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or name in skip_names:
             continue
         d = {"param": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
 

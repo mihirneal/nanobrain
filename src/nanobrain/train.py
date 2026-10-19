@@ -21,6 +21,7 @@ from torch.utils.flop_counter import FlopCounterMode
 import nanobrain.utils.misc as misc
 from nanobrain.data import BrainNpzDataset, process_batch
 from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
@@ -113,12 +114,45 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    param_groups = misc.get_param_groups(model)
-    misc.update_lr(param_groups, args.lr)
-    misc.update_wd(param_groups, args.weight_decay)
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    if args.optimizer == "adamw":
+        param_groups = misc.get_param_groups(model)
+        misc.update_lr(param_groups, args.lr)
+        misc.update_wd(param_groups, args.weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    elif args.optimizer == "muon":
+        muon_names = [
+            n for n, p in model.named_parameters()
+            if is_muon_param(
+                n, p, args.get("muon_encoder_only", False), args.get("muon_decoder_only", False)
+            )
+        ]
+        logger.info(f"muon params: {len(muon_names)} matrices")
+        adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+        params = dict(model.named_parameters())
+        muon_groups = [
+            {
+                "params": [params[n] for n in muon_names],
+                "lr_multiplier": args.muon_lr_mult,
+                "wd_multiplier": 1.0,
+            }
+        ]
+        for groups in (adamw_groups, muon_groups):
+            misc.update_lr(groups, args.lr)
+            misc.update_wd(groups, args.weight_decay)
+        optimizer = CombinedOptimizer(
+            [
+                torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw),
+                Muon(
+                    muon_groups,
+                    momentum=args.muon_momentum,
+                    fused=args.get("muon_fused", False),
+                ),
+            ]
+        )
+    else:
+        raise ValueError(f"unknown optimizer {args.optimizer}")
 
     epoch_num_batches = len(train_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -142,6 +176,13 @@ def main(args: DictConfig):
 
     # load checkpoint/resume training
     misc.load_model(args, model, optimizer, loss_scaler)
+
+    if args.get("prioritize_compute"):
+        # run the training step on a high priority stream, so the data prep kernels on the side
+        # stream (misc.pre_send_to_cuda_wrapper) mostly take the sms the step leaves idle
+        stream = torch.cuda.Stream(device, priority=-1)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        torch.cuda.set_stream(stream)
 
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
