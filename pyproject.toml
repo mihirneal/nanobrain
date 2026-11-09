@@ -63,7 +63,7 @@ torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flash-attn-3 = { index = "pytorch-cu130" }
 synthseg = { git = "https://github.com/MedARC-AI/SynthSeg.git", rev = "2690d9ac9ae28323d03043406cd21db0a8741547" }
-brainmarks-smri = { git = "https://github.com/MedARC-AI/brainmarks-smri.git", rev = "8ef7115d519a1d1f13910c1e13bcae331b0ca3ad" }
+brainmarks-smri = { git = "https://github.com/MedARC-AI/brainmarks-smri.git", rev = "d1eef0e91a7da5ce62aab15d1e7f437d89555d4b" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
