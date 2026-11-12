@@ -12,8 +12,14 @@ from torch import Tensor
 from torch.utils.data import Dataset, Sampler
 
 
+# openbhb source collections: their images train the mae, never the age head
+AGE_EXCLUDE = (
+    "ds003974", "ds001510", "ds001554", "ds001145", "ds001131", "ds001132", "ds004042", "ds000109"
+)
+
+
 class Fomo300kDataset(Dataset):
-    def __init__(self, root: str | Path, filelist: str | Path):
+    def __init__(self, root: str | Path, filelist: str | Path, age_target: str | None = None):
         self.root = Path(root)
         self.paths = Path(filelist).read_text().split()
         members = pd.read_parquet(
@@ -23,6 +29,7 @@ class Fomo300kDataset(Dataset):
         self.shards = members["shard"].tolist()
         self.offsets = members["offset"].to_numpy()
         self.sizes = members["size"].to_numpy()
+        self.ages = None if age_target is None else age_targets(self.root, self.paths, age_target)
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -41,7 +48,48 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
+        if self.ages is not None:
+            sample["age"] = float(self.ages[index])
         return sample
+
+
+def age_targets(root: Path, paths: list[str], target: str) -> np.ndarray:
+    # images.parquet age per path, NaN = no label. within: (age - collection mean) / 10 over the
+    # aged images of the list, NaN for collections with < 20 of them or age sd < 1 y.
+    # raw: (age - 30) / 20. global: standardized over the list's labelled images (fino3d)
+    assert target in ("within", "raw", "global"), f"unknown age_target {target}"
+    table = pd.read_parquet(root / "tables" / "images.parquet", columns=["path", "collection", "age"])
+    # npz key as in select_images
+    key = table["path"].str.removeprefix("source/").str.removesuffix(".nii.gz")
+    table = table.set_index("derivatives/" + key + ".npz").loc[paths]
+    age = table["age"].astype(float)
+    age[table["collection"].str.split("/").str[-1].isin(AGE_EXCLUDE).to_numpy()] = np.nan
+    if target == "raw":
+        return ((age - 30) / 20).to_numpy(np.float32)
+    if target == "global":
+        return ((age - age.mean()) / age.std(ddof=0)).to_numpy(np.float32)
+    by = age.groupby(table["collection"])
+    count, mean, sd = by.transform("count"), by.transform("mean"), by.transform("std")
+    return ((age - mean) / 10).where((count >= 20) & (sd >= 1)).to_numpy(np.float32)
+
+
+def subject_keys(paths: list[str]) -> list[str]:
+    # collection / sub-* part of derivatives/<collection>/[<ds>/]<sub>/...
+    keys = []
+    for path in paths:
+        parts = path.split("/")
+        cut = next((ii for ii, part in enumerate(parts) if part.startswith("sub")), 2)
+        keys.append("/".join(parts[: cut + 1]))
+    return keys
+
+
+def subject_temper_weights(paths: list[str], alpha: float, count_paths: list[str] | None = None) -> torch.Tensor:
+    # per-image weight n_subject^-alpha: 0 = uniform over images, 1 = uniform over subjects
+    counts: dict[str, int] = {}
+    for key in subject_keys(count_paths or paths):
+        counts[key] = counts.get(key, 0) + 1
+    n = torch.tensor([counts[key] for key in subject_keys(paths)], dtype=torch.float64)
+    return n.pow(-alpha)
 
 
 class InfiniteSampler(Sampler[int]):
@@ -49,21 +97,46 @@ class InfiniteSampler(Sampler[int]):
     each rank takes every world_size-th sample of the same stream."""
 
     def __init__(
-        self, num_samples: int, seed: int = 0, start: int = 0, rank: int = 0, world_size: int = 1
+        self,
+        num_samples: int,
+        seed: int = 0,
+        start: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+        late_indices: list[int] | None = None,
+        switch_at: int | None = None,
     ):
         self.num_samples = num_samples
         self.seed = seed
         self.start = start
         self.rank = rank
         self.world_size = world_size
+        # from sample index switch_at on, endless shuffled passes over late_indices only (anneal mix)
+        self.late_indices = late_indices
+        self.switch_at = switch_at if late_indices is not None else None
+        # per-image sampling weights: passes of num_samples draws with replacement (None = permutations)
+        self.weights = None
+
+    def _pass(self, generator):
+        if self.weights is None:
+            return torch.randperm(self.num_samples, generator=generator).tolist()
+        return torch.multinomial(self.weights, self.num_samples, replacement=True, generator=generator).tolist()
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
-        while True:
-            for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
+        while self.switch_at is None or index < self.switch_at:
+            for sample_index in self._pass(generator):
+                if self.switch_at is not None and index >= self.switch_at:
+                    break
                 if index >= self.start and index % self.world_size == self.rank:
                     yield sample_index
+                index += 1
+        late_generator = torch.Generator().manual_seed(self.seed + 1)
+        while True:
+            for ii in torch.randperm(len(self.late_indices), generator=late_generator).tolist():
+                if index >= self.start and index % self.world_size == self.rank:
+                    yield self.late_indices[ii]
                 index += 1
 
 
@@ -105,6 +178,26 @@ def reorient_to_ras(
     image = image.flip(flip_axes).permute(order)
     mask = mask.flip(flip_axes).permute(order)
     return image, mask, new_affine
+
+
+def native_spacing(affine: np.ndarray, target_spacing: float = 1.0) -> tuple[float, float, float]:
+    # voxel size per axis. header float noise around target_spacing snaps to it, the rest rounds to
+    # 1e-4 mm so scans from one protocol share a spacing
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    return tuple(
+        target_spacing if abs(sp - target_spacing) < 1e-3 else round(float(sp), 4) for sp in spacing
+    )
+
+
+def native_box(
+    spacing: tuple[float, float, float], box_mm: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    # the box_mm box in voxels of this spacing, rounded up unless whole up to float noise
+    shape = []
+    for mm, sp in zip(box_mm, spacing):
+        size = mm / sp
+        shape.append(round(size) if abs(size - round(size)) < 1e-2 else math.ceil(size))
+    return tuple(shape)
 
 
 def resample_to_spacing(

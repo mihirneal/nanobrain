@@ -1,0 +1,83 @@
+# Walnut v2: the exact recipe of the released checkpoint (ViT-L, 4 mm patches, 85% masking in 8 mm cubes,
+# Muon, decoder qk norm, level/mirror/residual/decoder-level heads, mlp age head from 65% of training),
+# 253,418 FOMO-300K QC images, 20 epochs on 8 GPUs (4 images per GPU, 32 per step). epochs set the schedule;
+# total/warmup/decay_steps below are overwritten from them at startup.
+#   experiments/walnut_v2/train.sh   (run from a clean checkout of this commit)
+train_filelist: src/nanobrain/config/fomo300k_images_qc.txt
+patch_size: 4
+num_visible: 4096
+num_predict: 4096
+model_kwargs:
+  depth: 24
+  embed_dim: 1024
+  num_heads: 16
+  decoder_depth: 4
+  decoder_embed_dim: 512
+  decoder_num_heads: 8
+  class_tokens: 0
+  decoder_qk_norm: true
+  qk_scale_init: 4.0
+  mask_cube: 2
+  level_weight: 0.5
+  level_thresholds:
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+  - 1.5
+  - 2.0
+  - 2.5
+  - 3.0
+  level_pool2: 4
+  level_resid:
+  - 1.0
+  - 1.5
+  - 2.0
+  level_mirror:
+  - 1.0
+  - 1.5
+  - 2.0
+  level_mirror_margin: 0.5
+  decoder_level_weight: 0.5
+  age_weight: 0.03
+  age_head: mlp
+  age_gamma_max: 0.7
+  age_grad: 1.0
+batch_size: 4
+base_lr: 0.001
+time_limit: null
+total_steps: 54195
+warmup_steps: 13549
+decay_steps: 10839
+optimizer: muon
+muon_lr_mult: 2.0
+muon_fused: true
+flash_attention_impl: FA3
+checkpoint_period: 8000
+plot_period: 0
+epochs: 20
+warmup_epochs: 5.0
+decay_epochs: 4.0
+accum_iter: 1
+checkpoint_steps:
+- 15839
+- 31677
+- 47516
+- 63354
+- 79193
+- 95032
+- 110870
+- 126709
+- 142548
+num_workers: 12
+prefetch_factor: 4
+prep_threads: 3
+prep_lean: true
+gc_freeze: true
+fast_startup: true
+high_priority_stream: true
+decoder_prune_last: true
+age_target: global
+age_start: 0.65
+
+require_clean_git: true

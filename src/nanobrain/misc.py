@@ -7,12 +7,15 @@
 # dino: https://github.com/facebookresearch/dino/blob/main/utils.py
 
 import datetime
+import itertools
 import logging
 import os
+import queue
 import random
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from collections import defaultdict, deque
 from omegaconf import OmegaConf
@@ -508,6 +511,75 @@ def pre_send_to_cuda_wrapper(generator, batch_transform=None, device=None):
         yield data
 
 
+def prep_thread(loader, batch_transform, device, num_threads: int = 1, depth: int = 1):
+    # send + transform the next batches in background threads, each on its own side stream, so the
+    # gpu prep's ~3.5k small launches per batch overlap the model's cpu work instead of draining the
+    # gpu queue. thread k preps batches k, k + n, ..., consumed in loader order
+    it = iter(loader)
+    turn = threading.Condition()
+    state = {"next": 0}
+    queues = [queue.Queue(maxsize=depth) for _ in range(num_threads)]
+    stop = threading.Event()
+
+    def put(q, item):
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=1)
+                return
+            except queue.Full:
+                pass
+
+    def run(k):
+        stream = torch.cuda.Stream(device)
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                for index in itertools.count(k, num_threads):
+                    with turn:
+                        turn.wait_for(lambda: state["next"] == index or stop.is_set())
+                        if stop.is_set():
+                            return
+                        batch = next(it, None)
+                        state["next"] += 1
+                        turn.notify_all()
+                    if batch is None:
+                        put(queues[k], None)
+                        return
+                    batch = batch_transform(send_data(batch, device=device))
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    put(queues[k], (batch, event))
+        except BaseException as e:  # noqa: BLE001
+            put(queues[k], e)
+
+    threads = [threading.Thread(target=run, args=(k,), daemon=True) for k in range(num_threads)]
+    for thread in threads:
+        thread.start()
+    try:
+        for index in itertools.count():
+            item = queues[index % num_threads].get()
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            batch, event = item
+            main_stream = torch.cuda.current_stream(device)
+            main_stream.wait_event(event)
+            record_stream(batch, main_stream)
+            yield batch
+    finally:
+        stop.set()
+        with turn:
+            turn.notify_all()
+        for thread in threads:
+            thread.join(timeout=60)
+        # the loader iterator lives in the threads' closure, so it may outlive this generator. its
+        # workers ignore SIGTERM (ignore_sigterm), so multiprocessing's exit handler would hang on them
+        shutdown = getattr(it, "_shutdown_workers", None)
+        if shutdown is not None:
+            shutdown()
+
+
+
 # other misc utils
 
 
@@ -574,6 +646,11 @@ def git_info(path: Path = Path(__file__).parent) -> dict[str, Any] | None:
         "dirty": bool(status),
         "remote": remote or None,
     }
+
+
+def git_status(path: Path) -> str:
+    """`git status --porcelain` of the repo containing `path`, untracked files included ("" = clean)."""
+    return subprocess.run(["git", "status", "--porcelain"], cwd=path, capture_output=True, text=True).stdout.strip()
 
 
 def snapshot_source(src_dir: Path, path: Path) -> None:

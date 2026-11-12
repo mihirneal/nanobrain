@@ -1,5 +1,8 @@
 import argparse
 import datetime
+import functools
+import gc
+import hashlib
 import json
 import logging
 import os
@@ -23,16 +26,19 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.misc as misc
+import nanobrain.prep as prep
 from nanobrain.data import (
     Fomo300kDataset,
     InfiniteSampler,
+    subject_temper_weights,
     brle_to_dense,
     fit_to_shape,
+    native_spacing,
     normalize_values,
     reorient_to_ras,
     resample_to_spacing,
 )
-from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.model import ViTMAE3D, age_ramp, patches_to_volume
 from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
@@ -53,6 +59,9 @@ def main(args: DictConfig):
         dist.init_process_group(backend="nccl")
     rank, world_size = misc.get_rank(), misc.get_world_size()
     device = torch.device(args.device)
+    if device.type == "cuda" and device.index is None:
+        # explicit index: prep threads don't inherit set_device
+        device = torch.device("cuda", torch.cuda.current_device())
     # the ranks draw different views; rank 0's model init is broadcast by ddp
     misc.random_seed(args.seed + rank)
 
@@ -76,7 +85,12 @@ def main(args: DictConfig):
     logger.info("pretraining nanobrain")
     logger.info(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"cwd: {Path.cwd()}")
-    logger.info(f"git: {misc.git_info()}")
+    git = misc.git_info()
+    logger.info(f"git: {git}")
+    if args.require_clean_git:
+        # release runs: the code must be exactly a commit (tracked and untracked files)
+        status = misc.git_status(Path(__file__).parent)
+        assert git is not None and not status, f"require_clean_git: not a clean git checkout\n{status}"
     if device.type == "cuda":
         logger.info(f"gpu: {torch.cuda.get_device_name(device)}")
     logger.info(f"torch: {torch.__version__} (cuda {torch.version.cuda})")
@@ -96,8 +110,20 @@ def main(args: DictConfig):
             config=OmegaConf.to_container(args),
         )
 
+    snapshot = None
     if misc.is_main_process():
-        misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
+        snapshot_args = (ROOT / "src", output_dir / "source.tar.gz")
+        if args.fast_startup:
+            # ~2 s of gzip off the clock, joined before the summary
+            snapshot = threading.Thread(target=misc.snapshot_source, args=snapshot_args)
+            snapshot.start()
+        else:
+            misc.snapshot_source(*snapshot_args)
+
+    # plot_examples encodes one sequence per image, level_resid pairs two
+    assert not (args.model_kwargs.get("level_resid") and args.plot_period), "set plot_period 0 with level_resid"
+    # the example plots assume the 1 mm grid
+    assert not (args.native and args.plot_period), "set plot_period 0 with native"
 
     if args.flash_attention_impl:
         # e.g. FA3 (flash-attn-3), with sdpa's cudnn / mem efficient backends off so flash runs
@@ -108,6 +134,7 @@ def main(args: DictConfig):
 
     # model
     model = ViTMAE3D.from_config(args)
+    model.decoder_prune_last = args.decoder_prune_last
     model.to(device)
     logger.info(f"model:\n{model}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -120,7 +147,13 @@ def main(args: DictConfig):
     if args.distributed:
         model = DDP(model, broadcast_buffers=False)
 
-    if args.compile:
+    if args.compile and args.native:
+        # the image shapes vary, so only the fixed-shape transformer parts compile
+        model_without_ddp.compile_native()
+    elif args.compile and args.cudagraphs:
+        assert not args.distributed, "cudagraphs is single gpu only"
+        model_without_ddp.compile_cudagraphs()
+    elif args.compile:
         # in place compile keeps the state dict keys
         model.compile()
 
@@ -141,8 +174,13 @@ def main(args: DictConfig):
 
     optimizer = make_optimizer(args, model_without_ddp)
 
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    # the age head trains on the dataset's age targets
+    age_weight = args.model_kwargs.get("age_weight")
+    assert bool(args.age_target) == bool(age_weight), "set age_target and age_weight together"
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist, args.age_target)
     logger.info(f"train dataset: {len(dataset)} images")
+    filelist_sha256 = hashlib.sha256(Path(args.train_filelist).read_bytes()).hexdigest()
+    logger.info(f"train filelist: {args.train_filelist} sha256 {filelist_sha256}, data root {DATA_ROOT / 'fomo300k'}")
 
     if args.epochs:
         # schedule in epochs: the step counts follow from the dataset size and the global batch
@@ -170,25 +208,55 @@ def main(args: DictConfig):
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
+    late_indices = switch_at = None
+    if args.anneal_filelist:
+        # the lr decay phase draws only from this subset of train_filelist
+        late = set(Path(args.anneal_filelist).read_text().split())
+        late_indices = [ii for ii, path in enumerate(dataset.paths) if path in late]
+        assert late_indices, f"{args.anneal_filelist} shares no paths with {args.train_filelist}"
+        switch_at = (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
+        logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
     sampler = InfiniteSampler(
         len(dataset),
         seed=args.seed,
         start=start_step * args.accum_iter * args.batch_size * world_size,
         rank=rank,
         world_size=world_size,
+        late_indices=late_indices,
+        switch_at=switch_at,
     )
+    if args.subject_temper:
+        count_paths = Path(args.subject_temper_list).read_text().split() if args.subject_temper_list else None
+        sampler.weights = subject_temper_weights(dataset.paths, float(args.subject_temper), count_paths)
+        n_eff = sampler.weights.sum() ** 2 / sampler.weights.pow(2).sum()
+        logger.info(f"subject temper {args.subject_temper}: effective images {n_eff:.0f} of {len(dataset)}")
+    fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
-        collate_fn=list,  # no collate, variable shapes
+        # no collate (variable shapes); the fast prep plans its numpy part in the workers
+        collate_fn=list if not fast_prep else functools.partial(
+            prep.plan_batch,
+            target_spacing=args.target_spacing,
+            clip_quantiles=tuple(args.clip_quantiles),
+            lean=args.prep_lean,
+        ),
         pin_memory=True,
         drop_last=True,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         worker_init_fn=ignore_sigterm,
     )
-    batch_transform = make_batch_transform(args)
+    if fast_prep:
+        batch_transform = prep.make_batch_transform(
+            args.grid_size, args.target_spacing, tuple(args.clip_quantiles), lean=args.prep_lean
+        )
+    else:
+        batch_transform = make_batch_transform(args)
+    if args.prep_threads:
+        train_loader = misc.prep_thread(train_loader, batch_transform, device, args.prep_threads)
+        batch_transform = None
 
     # on SIGTERM (e.g. preemption) finish the current step, save and exit. resumes when relaunched
     stop_event = threading.Event()
@@ -213,6 +281,8 @@ def main(args: DictConfig):
 
     if args.distributed:
         dist.destroy_process_group()
+    if snapshot is not None:
+        snapshot.join()
     if not misc.is_main_process():
         return
 
@@ -236,6 +306,8 @@ def main(args: DictConfig):
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "git": misc.git_info(),
+        "train_filelist_sha256": filelist_sha256,
+        "data_root": str(DATA_ROOT / "fomo300k"),
     }
     with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
@@ -252,7 +324,7 @@ def train(
     model: nn.Module,
     model_without_ddp: nn.Module,
     data_loader: Iterable,
-    batch_transform: Callable,
+    batch_transform: Callable | None,
     optimizer: torch.optim.Optimizer,
     loss_scaler: torch.GradScaler | None,
     lr_schedule: np.ndarray,
@@ -302,6 +374,13 @@ def train(
 
     optimizer.zero_grad()
 
+    if args.high_priority_stream and device.type == "cuda":
+        # model work on a high priority stream: the prep threads' kernels (priority 0 side streams)
+        # only take the sms it leaves free. autograd runs the backward on the forward's stream
+        stream = torch.cuda.Stream(device, priority=-1)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        torch.cuda.set_stream(stream)
+
     batches = metric_logger.log_every(
         data_loader,
         print_freq_batches,
@@ -316,13 +395,19 @@ def train(
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
-        batch = misc.send_data(batch, device)
-
-        # run volume processing on gpu, not cpu workers, ~25x faster
-        batch = batch_transform(batch)
+        # run volume processing on gpu, not cpu workers, ~25x faster (prep threads: already done)
+        if batch_transform is not None:
+            batch = batch_transform(misc.send_data(batch, device))
         images = batch["image"]
         masks = batch["mask"]
 
+        age_gamma = None
+        if model_without_ddp.age_scaled and model_without_ddp.age_gamma_max:
+            # fino3d ramp of the age head's gradient into the encoder, on training progress
+            age_gamma = age_ramp(model_without_ddp.age_gamma_max, (step / total_steps - args.age_start) / (1 - args.age_start))
+            model_without_ddp.age_gamma.fill_(age_gamma)
+        if args.cudagraphs:
+            torch.compiler.cudagraph_mark_step_begin()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -331,10 +416,16 @@ def train(
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
+                spacing=batch.get("spacing"),
+                age=batch.get("age"),
             )
 
-        loss_for_log = loss.detach()
+        # the cuda graph's output buffer is overwritten by the next replay
+        loss_for_log = loss.detach().clone() if args.cudagraphs else loss.detach()
         torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
+        mirror_stats = None
+        if log_step and model_without_ddp.level_mirror_stat_names:
+            mirror_stats = model_without_ddp.level_mirror_stats.clone()
 
         grad_norm = misc.backward_step(
             loss / args.accum_iter,
@@ -361,6 +452,10 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if mirror_stats is not None:
+                log_stats.update(zip(model_without_ddp.level_mirror_stat_names, mirror_stats.tolist()))
+            if age_gamma is not None:
+                log_stats["age_gamma"] = age_gamma
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -370,6 +465,10 @@ def train(
         if not need_update:
             continue
         step += 1
+        if args.gc_freeze and step == start_step + 1:
+            # compile is done: later gen 2 collections skip the startup objects
+            gc.collect()
+            gc.freeze()
         wall_time = prev_wall_time + time.monotonic() - start_time
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
@@ -467,9 +566,13 @@ def make_batch_transform(args: DictConfig):
                 target_spacing=args.target_spacing,
                 grid_size=tuple(args.grid_size),
                 clip_quantiles=tuple(args.clip_quantiles),
+                native=args.native,
             )
             for sample in batch
         ]
+        if args.native:
+            # each image on its own voxel grid
+            return {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
         return {"image": images, "mask": masks}
@@ -483,13 +586,19 @@ def sample_transform(
     target_spacing: float = 1.0,
     grid_size: tuple[int, int, int] = (192, 240, 192),
     clip_quantiles: tuple[float, float] = (0.005, 0.995),
+    native: bool = False,
 ) -> dict[str, Tensor]:
     # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
+    # (native training still evaluates on 1 mm inputs)
     values = sample["values"].float() * sample["scale"]
     values = normalize_values(values, clip_quantiles)
     mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
+    if native:
+        # no resampling. forward_native fits the grid_size mm box in the image's own voxels
+        spacing = native_spacing(affine, target_spacing)
+        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
     image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
     image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
     return {"image": image, "mask": mask, "affine": affine}
